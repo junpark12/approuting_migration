@@ -424,9 +424,6 @@ spec:
 
 ## 참고 B. Annotation → Gateway API 변환 결과 (ingress2gateway 기준)
 
-고객사 환경에서 실제 사용 중인 36개 annotation을 ingress2gateway로 변환한 결과다.
-대부분 변환되지 않으며, 수동으로 Gateway API 방식으로 재구현해야 한다.
-
 ### 변환 결과 요약
 
 | 구분 | Annotation | ingress2gateway 결과 | Gateway API 대안 |

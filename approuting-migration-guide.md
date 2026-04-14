@@ -525,15 +525,7 @@ rules:
 
 > ⚠️ **sessionPersistence는 Gateway API v1.1 실험적(Experimental) 기능이다.**
 > App Routing Istio가 이 스펙을 실제로 구현했는지 별도 확인이 필요하다.
-> 동작하지 않을 경우 아래 대안을 검토해야 한다.
-
-**동작하지 않을 경우 대안:**
-
-| 대안 | 가능 여부 | 비고 |
-|---|---|---|
-| Istio `DestinationRule` (consistentHash) | ❌ | App Routing Istio는 Istio CRDs 미설치 — 사용 불가 |
-| Full Istio Mesh + `DestinationRule` | ✅ | App Routing Istio와 동시 사용 불가 — 마이그레이션 방향 변경 필요 |
-| **앱 레벨 sticky session** | ✅ | 가장 확실한 대안. 앱에서 직접 Set-Cookie 처리 |
+> 동작하지 않을 경우 **앱 레벨 sticky session 처리**가 유일한 대안이다.
 
 > session-cookie-secure, session-cookie-path는 Gateway API 스펙에 없음 → 앱 레벨에서 Set-Cookie 헤더로 처리.
 

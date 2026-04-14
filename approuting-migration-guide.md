@@ -523,7 +523,19 @@ rules:
     absoluteTimeout: 3600s
 ```
 
-> ⚠️ session-cookie-secure, session-cookie-path는 Gateway API 스펙에 없음 → 앱 레벨에서 Set-Cookie 헤더로 처리.
+> ⚠️ **sessionPersistence는 Gateway API v1.1 실험적(Experimental) 기능이다.**
+> App Routing Istio가 이 스펙을 실제로 구현했는지 별도 확인이 필요하다.
+> 동작하지 않을 경우 아래 대안을 검토해야 한다.
+
+**동작하지 않을 경우 대안:**
+
+| 대안 | 가능 여부 | 비고 |
+|---|---|---|
+| Istio `DestinationRule` (consistentHash) | ❌ | App Routing Istio는 Istio CRDs 미설치 — 사용 불가 |
+| Full Istio Mesh + `DestinationRule` | ✅ | App Routing Istio와 동시 사용 불가 — 마이그레이션 방향 변경 필요 |
+| **앱 레벨 sticky session** | ✅ | 가장 확실한 대안. 앱에서 직접 Set-Cookie 처리 |
+
+> session-cookie-secure, session-cookie-path는 Gateway API 스펙에 없음 → 앱 레벨에서 Set-Cookie 헤더로 처리.
 
 #### 5. Timeouts → HTTPRoute timeouts (v1.1+)
 
@@ -555,7 +567,10 @@ rules:
         value: "Authorization, Content-Type, X-Custom-Header"
 ```
 
-> ⚠️ OPTIONS preflight 처리는 별도 매칭 rule 추가 필요. 앱 레벨에서 처리하는 것이 더 안정적.
+> ⚠️ **ResponseHeaderModifier는 응답에 헤더를 추가할 뿐, OPTIONS preflight 요청에 200 OK를 대신 응답하지 않는다.**
+> 브라우저가 보내는 OPTIONS preflight는 별도 매칭 rule로 처리해야 하는데,
+> Gateway API 표준에는 고정 응답(Direct Response) filter가 없어 Istio 전용 확장이 필요하다.
+> 이 경우 복잡도가 급격히 상승하므로 **앱 레벨에서 CORS를 처리하는 것을 강력히 권장**한다.
 
 #### 7. custom-http-errors / default-backend → 대안 없음
 

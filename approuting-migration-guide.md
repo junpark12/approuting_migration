@@ -422,132 +422,182 @@ spec:
 
 ---
 
-## 참고 B. 무시된 Annotation과 Gateway API 대응 방안
+## 참고 B. Annotation → Gateway API 변환 결과 (ingress2gateway 기준)
 
-| NGINX Annotation | 변환 | Gateway API 대응 방법 |
+고객사 환경에서 실제 사용 중인 36개 annotation을 ingress2gateway로 변환한 결과다.
+대부분 변환되지 않으며, 수동으로 Gateway API 방식으로 재구현해야 한다.
+
+### 변환 결과 요약
+
+| 구분 | Annotation | ingress2gateway 결과 | Gateway API 대안 |
+|---|---|---|---|
+| **✅ 변환됨** | `rewrite-target` | URLRewrite filter로 변환 | — |
+| **⚠️ best-effort** | `proxy-read-timeout` + `proxy-send-timeout` | `timeouts.request`로 합산 변환 | HTTPRoute `timeouts` (v1.1+) |
+| **⚠️ best-effort** | `proxy-body-size` | 경고 후 무시 ("구현체 기본값 사용") | 구현체별 Policy |
+| **❌ 미지원** | `ssl-redirect` | Unsupported | HTTPRoute `RequestRedirect` filter |
+| **❌ 미지원** | `force-ssl-redirect` | Unsupported | HTTPRoute `RequestRedirect` filter |
+| **❌ 미지원** | `ssl-protocols` | Unsupported | Gateway listener TLS 설정 |
+| **❌ 미지원** | `ssl-ciphers` | Unsupported | Gateway listener TLS 설정 |
+| **❌ 미지원** | `ssl-prefer-server-ciphers` | Unsupported | Gateway listener TLS 설정 |
+| **❌ 미지원** | `hsts` | Unsupported | HTTPRoute `ResponseHeaderModifier` filter |
+| **❌ 미지원** | `hsts-max-age` | Unsupported | HTTPRoute `ResponseHeaderModifier` filter |
+| **❌ 미지원** | `hsts-include-subdomains` | Unsupported | HTTPRoute `ResponseHeaderModifier` filter |
+| **❌ 미지원** | `backend-protocol` | Unsupported | HTTPRoute backendRef (HTTP/HTTPS) |
+| **❌ 미지원** | `use-http2` | Unsupported | Gateway API는 HTTP/2 기본 지원 |
+| **❌ 미지원** | `proxy-connect-timeout` | Unsupported | HTTPRoute `timeouts` |
+| **❌ 미지원** | `proxy-send-timeout` | Unsupported | HTTPRoute `timeouts` |
+| **❌ 미지원** | `send-timeout` | Unsupported | HTTPRoute `timeouts` |
+| **❌ 미지원** | `cors-allow-origin` | Unsupported | 수동 HTTPRoute filter 또는 앱 레벨 |
+| **❌ 미지원** | `cors-allow-methods` | Unsupported | 수동 HTTPRoute filter 또는 앱 레벨 |
+| **❌ 미지원** | `cors-allow-headers` | Unsupported | 수동 HTTPRoute filter 또는 앱 레벨 |
+| **❌ 미지원** | `affinity: cookie` | "Session affinity is not supported" | HTTPRoute `sessionPersistence` (v1.1+) |
+| **❌ 미지원** | `session-cookie-name` | Unsupported | HTTPRoute `sessionPersistence.sessionName` |
+| **❌ 미지원** | `session-cookie-secure` | Unsupported | 대안 없음 (앱 레벨 처리) |
+| **❌ 미지원** | `session-cookie-path` | Unsupported | 대안 없음 (앱 레벨 처리) |
+| **❌ 미지원** | `session-cookie-expires` | Unsupported | 대안 없음 (앱 레벨 처리) |
+| **❌ 미지원** | `session-cookie-max-age` | Unsupported | HTTPRoute `sessionPersistence` (v1.1+) |
+| **❌ 미지원** | `custom-http-errors` | Unsupported | **대안 없음** (App GW도 backend 오류 통과) |
+| **❌ 미지원** | `default-backend` | Unsupported | catch-all HTTPRoute (부분 대체만 가능) |
+| **❌ 미지원** | `client-max-body-size` | Unsupported | 구현체별 Policy |
+| **❌ 미지원** | `proxy-buffer-size` | Unsupported | 구현체별 Policy |
+| **❌ 미지원** | `proxy-buffering` | Unsupported | 구현체별 Policy |
+| **❌ 미지원** | `proxy-request-buffering` | Unsupported | 구현체별 Policy |
+| **❌ 미지원** | `proxy-charset` | Unsupported | 대안 없음 (앱 레벨 처리) |
+| **❌ 미지원** | `client-header-buffer-size` | Unsupported | 대안 없음 |
+| **❌ 미지원** | `large-client-header-buffers` | Unsupported | 대안 없음 |
+| **❌ 미지원** | `keepalive` | Unsupported | Gateway API는 keepalive 기본 지원 |
+| **❌ 미지원** | `proxy-http-version` | Unsupported | 대안 없음 |
+
+---
+
+### 대안 상세
+
+#### 1. SSL Redirect → RequestRedirect filter
+
+```yaml
+# HTTPRoute에 filter 추가
+rules:
+- filters:
+  - type: RequestRedirect
+    requestRedirect:
+      scheme: https
+      statusCode: 301
+```
+
+#### 2. HSTS → ResponseHeaderModifier filter
+
+```yaml
+rules:
+- filters:
+  - type: ResponseHeaderModifier
+    responseHeaderModifier:
+      add:
+      - name: Strict-Transport-Security
+        value: "max-age=31536000; includeSubDomains"
+```
+
+#### 3. TLS 설정 (ssl-protocols, ssl-ciphers) → Gateway listener
+
+```yaml
+# Gateway listener에서 직접 설정
+listeners:
+- name: https
+  port: 443
+  protocol: HTTPS
+  tls:
+    mode: Terminate
+    options:
+      gateway.istio.io/tls-min-protocol-version: TLSV1_2
+```
+
+> ⚠️ ssl-ciphers는 Gateway API 표준 스펙 외 영역. App Routing Istio에서 지원 여부 별도 확인 필요.
+
+#### 4. Session Affinity → sessionPersistence (Gateway API v1.1+)
+
+```yaml
+# HTTPRoute backendRef에 추가
+rules:
+- backendRefs:
+  - name: echo
+    port: 80
+  sessionPersistence:
+    sessionName: INGRESSCOOKIE
+    type: Cookie
+    absoluteTimeout: 3600s
+```
+
+> ⚠️ session-cookie-secure, session-cookie-path는 Gateway API 스펙에 없음 → 앱 레벨에서 Set-Cookie 헤더로 처리.
+
+#### 5. Timeouts → HTTPRoute timeouts (v1.1+)
+
+```yaml
+rules:
+- backendRefs:
+  - name: echo
+    port: 80
+  timeouts:
+    request: 120s        # proxy-read-timeout 대응
+    backendRequest: 30s  # proxy-connect-timeout 대응
+```
+
+#### 6. CORS → ResponseHeaderModifier filter
+
+Gateway API에 CORS 전용 filter가 없으므로 헤더를 직접 추가:
+
+```yaml
+rules:
+- filters:
+  - type: ResponseHeaderModifier
+    responseHeaderModifier:
+      add:
+      - name: Access-Control-Allow-Origin
+        value: "https://app.contoso.com"
+      - name: Access-Control-Allow-Methods
+        value: "GET, POST, PUT, DELETE, OPTIONS"
+      - name: Access-Control-Allow-Headers
+        value: "Authorization, Content-Type, X-Custom-Header"
+```
+
+> ⚠️ OPTIONS preflight 처리는 별도 매칭 rule 추가 필요. 앱 레벨에서 처리하는 것이 더 안정적.
+
+#### 7. custom-http-errors / default-backend → 대안 없음
+
+| 접근 | 설명 | 한계 |
 |---|---|---|
-| `ssl-redirect: "false"` | ❌ 무시 | Gateway listener에서 HTTP/HTTPS 분리 구성. redirect가 필요하면 HTTPRoute에 `RequestRedirect` filter 사용 |
-| `rewrite-target: /` | ❌ 무시 | HTTPRoute의 `URLRewrite` filter로 구현 |
-| `proxy-body-size: "10m"` | ❌ 무시 | Gateway API 표준 스펙에 없음. 구현체별 Policy(Istio: `EnvoyFilter`, AGC: `BackendSettingsPolicy`) 사용 |
-| `limit-rps: "50"` | ❌ 무시 | Gateway API 표준 스펙에 없음. 구현체별 Policy 또는 `BackendTrafficPolicy` 등으로 구현 |
-| `proxy-connect-timeout: "30"` | ❌ 무시 | HTTPRoute `BackendRef` timeout (실험적) 또는 구현체별 Policy. Istio: `VirtualService` timeout |
-| `proxy-read-timeout: "120"` | ❌ 무시 | 위와 동일. Gateway API에 `timeout` 필드 추가 논의 중 (GEP-1742) |
-| `custom-http-errors: "404,503"` | ❌ 무시 | Gateway API 미지원. 구현체별 커스텀 에러 페이지 설정 필요 |
-| `configuration-snippet` | ❌ 무시 | **가장 문제.** raw NGINX config 삽입이라 1:1 변환 불가. 기능별로 Gateway API filter 또는 구현체 Policy로 분해하여 재작성 필요 |
+| catch-all HTTPRoute | `/` PathPrefix로 error-page-svc 연결 | backend가 반환한 404/500은 처리 불가 |
+| App GW custom error page | App GW 레벨 설정 | App GW 자체 오류(502, 503)만 처리 가능. backend 오류는 통과 |
+| **앱 레벨 처리** | backend가 직접 error page 반환 | ✅ 유일한 완전한 대안 |
+
+#### 8. 버퍼/Body 크기 설정 → 구현체 기본값에 의존
+
+`proxy-body-size`, `proxy-buffer-size`, `proxy-buffering`, `client-max-body-size` 등은
+Gateway API 표준 스펙에 없으며, App Routing Istio(Envoy)의 기본값을 사용한다.
+
+Envoy 기본값:
+- request body: 제한 없음 (스트리밍)
+- buffer: 32KB
+
+대부분의 경우 기본값으로 충분하나, 대용량 파일 업로드 환경에서는 별도 확인 필요.
 
 ---
 
-## 참고 C. Annotation별 Gateway API 변환 예시
+### 마이그레이션 전 체크리스트
 
-### rewrite-target → URLRewrite filter
-
-**NGINX Ingress (기존):**
-```yaml
-annotations:
-  nginx.ingress.kubernetes.io/rewrite-target: /
-```
-
-**Gateway API (변환 후):**
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-spec:
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /app
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplacePrefixMatch
-          replacePrefixMatch: /
-    backendRefs:
-    - name: echo
-      port: 80
-```
-
-### ssl-redirect → RequestRedirect filter
-
-**NGINX Ingress (기존):**
-```yaml
-annotations:
-  nginx.ingress.kubernetes.io/ssl-redirect: "true"
-```
-
-**Gateway API (변환 후):**
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-spec:
-  parentRefs:
-  - name: my-gateway
-    sectionName: http
-  rules:
-  - filters:
-    - type: RequestRedirect
-      requestRedirect:
-        scheme: https
-        statusCode: 301
-```
-
-### proxy-read-timeout → HTTPRoute timeouts (실험적)
-
-**NGINX Ingress (기존):**
-```yaml
-annotations:
-  nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
-```
-
-**Gateway API (변환 후 - 실험적 기능):**
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-spec:
-  rules:
-  - backendRefs:
-    - name: echo
-      port: 80
-    timeouts:
-      backendRequest: 120s
-```
-
-> ⚠️ `timeouts`는 Gateway API v1.1+ 실험적 기능. 구현체별 지원 여부 확인 필요.
-
-### configuration-snippet → 기능별 분해
-
-**NGINX Ingress (기존):**
-```yaml
-annotations:
-  nginx.ingress.kubernetes.io/configuration-snippet: |
-    more_set_headers "X-Custom-Header: my-value";
-```
-
-**Gateway API (변환 후):**
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-spec:
-  rules:
-  - filters:
-    - type: ResponseHeaderModifier
-      responseHeaderModifier:
-        add:
-        - name: X-Custom-Header
-          value: my-value
-    backendRefs:
-    - name: echo
-      port: 80
-```
-
-> `configuration-snippet`에 여러 기능이 섞여 있는 경우, 각 기능을 개별 filter로 분해해야 한다.
-> 단순 헤더 추가는 위처럼 `ResponseHeaderModifier`로 대응 가능하지만,
-> NGINX 전용 디렉티브(proxy_set_header, if 조건 등)는 Gateway API로 직접 변환 불가.
+| 항목 | 영향도 | 조치 |
+|---|---|---|
+| ssl-redirect / force-ssl-redirect | 높음 | HTTPRoute RequestRedirect filter 수동 추가 |
+| HSTS | 중간 | ResponseHeaderModifier filter 수동 추가 |
+| Session affinity | 높음 | sessionPersistence 수동 추가 (v1.1+) |
+| Timeouts | 중간 | HTTPRoute timeouts 수동 추가 |
+| CORS | 높음 | ResponseHeaderModifier filter 수동 추가 또는 앱 레벨 처리 |
+| custom-http-errors | 높음 | **앱 레벨 처리 필요** (Gateway API 대안 없음) |
+| 버퍼/Body 크기 | 낮음 | Envoy 기본값 확인 후 필요시 조치 |
+| ssl-protocols / ssl-ciphers | 중간 | Gateway listener TLS 설정으로 대체 |
+| keepalive / use-http2 | 낮음 | Gateway API 기본 지원, 별도 설정 불필요 |
 
 ---
 
-## 참고 D. Gateway API Preview 제한사항 — DNS/TLS 자동 관리 미지원
+## 참고 C. Gateway API Preview 제한사항 — DNS/TLS 자동 관리 미지원
 
 ### NGINX App Routing (기존) — 자동 연동 가능
 
@@ -651,7 +701,7 @@ spec:
 
 ---
 
-## 참고 E. SNI Passthrough (TLSRoute) 미지원
+## 참고 D. SNI Passthrough (TLSRoute) 미지원
 
 ### SNI Passthrough란
 
@@ -776,7 +826,7 @@ NGINX ssl-passthrough:
 
 ---
 
-## 참고 F. App Routing Istio vs Full Istio Service Mesh
+## 참고 E. App Routing Istio vs Full Istio Service Mesh
 
 ### App Routing Istio (`--enable-app-routing-istio`)
 
@@ -884,7 +934,7 @@ az aks update -g myRG -n myCluster --enable-app-routing-istio
 > Full Istio 자체가 Gateway API를 지원하므로 Gateway + HTTPRoute를 직접 만들면 된다.
 > App Routing Istio는 **서비스 메시 없이 ingress만 Gateway API로 전환**하려는 환경을 위한 경량 옵션이다.
 
-## 참고 G. allowedRoutes — Gateway의 HTTPRoute 접근 범위 제한
+## 참고 F. allowedRoutes — Gateway의 HTTPRoute 접근 범위 제한
 
 ### NGINX와의 차이
 

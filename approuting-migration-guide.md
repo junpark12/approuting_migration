@@ -465,7 +465,7 @@ spec:
 | **❌ 미지원** | `proxy-charset` | Unsupported | 대안 없음 (앱 레벨 처리) |
 | **❌ 미지원** | `client-header-buffer-size` | Unsupported | 대안 없음 |
 | **❌ 미지원** | `large-client-header-buffers` | Unsupported | 대안 없음 |
-| **❌ 미지원** | `keepalive` | Unsupported | Gateway API는 keepalive 기본 지원 |
+| **❌ 미지원** | `keepalive` | Unsupported | keepalive 기본 활성화. 연결 수/timeout 세부 튜닝은 EnvoyFilter 필요 (App Routing Istio 불가) |
 | **❌ 미지원** | `proxy-http-version` | Unsupported | 대안 없음 |
 
 ---
@@ -593,7 +593,7 @@ Envoy 기본값:
 | custom-http-errors | 높음 | **앱 레벨 처리 필요** (Gateway API 대안 없음) |
 | 버퍼/Body 크기 | 낮음 | Envoy 기본값 확인 후 필요시 조치 |
 | ssl-protocols / ssl-ciphers | 중간 | Gateway listener TLS 설정으로 대체 |
-| keepalive / use-http2 | 낮음 | Gateway API 기본 지원, 별도 설정 불필요 |
+| keepalive / use-http2 | 낮음 | keepalive 기본 활성화. 세부 튜닝 불가 / HTTP2 기본 지원 |
 
 ---
 

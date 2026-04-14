@@ -692,13 +692,18 @@ spec:
 
 ### App Gateway 연동 환경에서의 영향
 
-App Gateway는 L7 로드밸런서로 항상 TLS를 종료하므로, 순수 SSL Passthrough를 지원하지 않는다.
-App Gateway + backend HTTPS 구성은 실질적으로 Re-encrypt 패턴이다.
+App Gateway는 L7 로드밸런서로 항상 TLS를 종료한다. backend와의 구간은 아래 두 가지 옵션으로 구성된다.
+
+---
+
+**옵션 1. Re-encrypt (App GW → backend HTTPS)**
+
+App GW가 TLS를 종료한 뒤, backend로 새 TLS 연결을 맺는 방식.
+backend가 HTTPS를 호스팅하는 경우 사용하며, App GW backend 설정에 backend의 root CA를 등록해야 한다.
 
 ```
-App GW Re-encrypt 패턴 (일반적):
-  Client ─TLS→ App GW (TLS 종료, L7 라우팅) ─새 TLS→ backend (https://api.contoso.com)
-                ↑ frontend 인증서 필요           ↑ backend 인증서 신뢰 설정 필요
+Client ─TLS→ App GW (TLS 종료, L7 라우팅) ─새 TLS→ backend (https://api.contoso.com)
+              ↑ frontend 인증서 필요           ↑ backend root CA를 App GW에 등록
 ```
 
 | 위치 | 인증서 | 용도 |
@@ -707,8 +712,28 @@ App GW Re-encrypt 패턴 (일반적):
 | App GW backend 설정 | ✅ backend의 root CA 등록 | App GW → backend 신뢰 |
 | backend | ✅ 필요 | App GW → backend 구간 TLS |
 
-> 이 패턴에서는 App GW가 TLS를 종료하고 L7 라우팅을 수행하므로,
-> Gateway API 레이어(NGINX/Istio)에서는 **HTTP만 받으면 됨 → 마이그레이션 영향 없음.**
+---
+
+**옵션 2. SSL Offload (App GW → backend HTTP)**
+
+App GW가 TLS를 종료한 뒤, backend로는 HTTP로 전달하는 방식.
+backend가 TLS를 처리하지 않아도 되므로 구성이 단순하다.
+
+```
+Client ─TLS→ App GW (TLS 종료, L7 라우팅) ─HTTP→ backend
+              ↑ frontend 인증서만 필요        ↑ backend는 TLS 불필요
+```
+
+| 위치 | 인증서 | 용도 |
+|---|---|---|
+| App GW frontend | ✅ 필요 | Client → App GW 구간 TLS |
+| App GW backend 설정 | ❌ CA 등록 불필요 | HTTP 연결이므로 신뢰 설정 없음 |
+| backend | ❌ 불필요 | HTTP 수신 |
+
+---
+
+> **두 옵션 모두** App GW에서 TLS를 종료하므로, Gateway API 레이어(NGINX/Istio)에서는
+> **HTTP만 받으면 됨 → 마이그레이션 영향 없음.**
 
 반면, NGINX에서 `ssl-passthrough`를 사용하는 환경은
 TLS를 복호화하지 않고 SNI만 보고 라우팅하는 구조인데, 이 패턴은 현재 Gateway API에서 미지원이다.

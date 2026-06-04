@@ -332,6 +332,91 @@ kubectl logs -n demo <gateway-pod-name> --tail=50
 
 > ✅ Preview 시점 고객 우려 사항(액세스 로그 부재)은 GA에서 해소된 것으로 관찰됩니다.
 
+### 7.4 Client IP 보존 (`externalTrafficPolicy: Local`)
+
+기본 설정에서는 access log의 `x_forwarded_for` / `downstream_remote_address`에 **실제 클라이언트 IP가 아닌 노드 IP(예: `10.224.0.5`)** 가 기록된다. 이는 Service의 `externalTrafficPolicy`가 기본값 `Cluster`이어서, kube-proxy가 외부 트래픽을 다른 노드의 Pod로 SNAT하면서 source IP가 노드 IP로 치환되기 때문이다.
+
+GA된 App Routing Gateway API add-on은 자동 생성된 Service의 일부 필드를 **§9 ConfigMap 커스터마이즈**를 통해 변경하는 것을 허용한다 (§9.4 Service allow-list 참고). 그 중 `spec.externalTrafficPolicy: Local`을 적용하면 외부 트래픽을 받은 노드의 로컬 Pod로만 라우팅 → SNAT 미발생 → 원본 client IP 보존된다.
+
+#### 적용 방법 (GatewayClass-level)
+
+`gatewayClassName: approuting-istio`인 모든 Gateway에 일괄 적용:
+
+```bash
+kubectl edit cm istio-gateway-class-defaults -n aks-istio-system
+```
+
+다음 `data.service` 블록을 추가/병합:
+
+```yaml
+data:
+  service: |
+    spec:
+      externalTrafficPolicy: Local
+```
+
+#### 적용 방법 (Gateway-level — 특정 Gateway만)
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-gateway-overrides
+  namespace: demo
+data:
+  service: |
+    spec:
+      externalTrafficPolicy: Local
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: pixel-istio-gw
+  namespace: demo
+spec:
+  gatewayClassName: approuting-istio
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: my-gateway-overrides
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+```
+
+#### 적용 후 확인
+
+```bash
+# Service 정책 확인
+kubectl get svc -n demo -l 'gateway.networking.k8s.io/gateway-name=pixel-istio-gw' \
+  -o jsonpath='{.items[0].spec.externalTrafficPolicy}'
+# → Local
+```
+
+실제 access log는 **Container Insights의 `ContainerLogV2` 테이블**에서 확인 가능 (Log Analytics workspace):
+
+```kusto
+ContainerLogV2
+| where PodNamespace == "demo"
+| where ContainerName has "istio-proxy" or PodName has "pixel-istio-gw"
+| extend log = parse_json(LogMessage)
+| project TimeGenerated,
+          x_forwarded_for = tostring(log.x_forwarded_for),
+          downstream      = tostring(log.downstream_remote_address),
+          method          = tostring(log.method),
+          path            = tostring(log.path),
+          status          = toint(log.response_code)
+| order by TimeGenerated desc
+```
+
+→ `x_forwarded_for` / `downstream_remote_address`에 실제 client public IP가 기록되는 것을 확인.
+
+> ⚠️ `externalTrafficPolicy: Local` 사이드 이펙트
+> - 외부 트래픽을 수신한 노드에 **해당 Gateway의 Pod가 1개 이상 있어야** 라우팅됨. Pod 없는 노드로 인입되면 패킷 drop → AKS LB의 health probe가 자동으로 Pod 없는 노드를 제외하므로 통상 문제 없으나, **HPA min replicas는 노드 수 대비 충분히** 두는 것이 안전.
+> - **트래픽이 노드 간 균등 분산되지 않을 수 있음** (노드별 Pod 수 차이에 따라). 필요 시 §9의 `topologySpreadConstraints`로 분산.
+
 ---
 
 ## 8. Session Affinity (sticky session) 현황

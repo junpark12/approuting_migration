@@ -626,6 +626,45 @@ kubectl get hpa httpbin-gateway-approuting-istio
 | Egress 트래픽 관리 | ❌ 미지원 | — |
 | Sidecar injection / Istio CRD 사용 | ❌ 미지원 (인프라 전용) | 메시 기능 필요 시 Istio mesh add-on 별도 사용 |
 
+### 10.1 알려진 이슈 — istiod HPA `requests.cpu` 누락 (Bug)
+
+**증상**
+
+App Routing Gateway API 활성화 시 `aks-istio-system` ns에는 고객 요청을 직접 처리하지는 않지만 컨트롤 플레인 `istiod-asm-...` Deployment가 자동 배포되며, 함께 HPA(HorizontalPodAutoscaler)도 생성된다. 그러나 해당 Deployment의 Pod 스펙에 **`resources.requests.cpu`가 누락**되어 HPA가 CPU 사용률을 계산할 기준점을 찾지 못해 이벤트에 오류가 반복 발생한다.
+
+```bash
+kubectl get hpa -n aks-istio-system
+kubectl describe hpa -n aks-istio-system <istiod-hpa-name>
+```
+
+```
+Warning  FailedGetResourceMetric        ...  failed to get cpu utilization:
+  missing request for cpu in container discovery of Pod istiod-asm-1-29-...
+Warning  FailedComputeMetricsReplicas   ...
+```
+
+```bash
+# Deployment 스펙 — requests 비어있음을 확인
+kubectl get deploy -n aks-istio-system -l app=istiod \
+  -o jsonpath='{.items[*].spec.template.spec.containers[*].resources}'
+```
+
+**영향**
+
+- istiod HPA가 metric 계산 불가 → **자동 스케일 아웃 미작동** (`minReplicas`로 고정 운영)
+- 관제/모니터링에서 이벤트 노이즈로 알람 오인식 가능
+- 고객이 배포한 **Gateway용 HPA(`<gateway-name>-...`)는 정상 동작** — 본 이슈는 컨트롤 플레인 측에만 해당
+
+**원인**
+
+`aks-istio-system` ns는 **AKS add-on managed** 영역으로, 고객이 Deployment/HPA 스펙을 직접 patch해도 add-on reconciler가 원상복구한다. AKS 측에서 배포하는 istiod manifest에 `requests.cpu`가 누락되어 있어 **고객 측 워크어라운드 불가**.
+
+**대응**
+
+- 본 항목은 **AKS(Microsoft) 쪽에서 관리하는 영역**이므로, **Azure Support 케이스를 통해 bug fix 요청** 예정.
+- 임시 회피책은 없음 (고객이 스펙을 patch 해도 reconcile 됨).
+- Gateway data plane(Envoy)의 HPA는 정상 동작하므로 서비스 가용성에 직접 영향은 없으나, 관제 이벤트 필터링이 필요할 수 있음.
+
 ---
 
 ## 11. Istio service mesh add-on과의 차이

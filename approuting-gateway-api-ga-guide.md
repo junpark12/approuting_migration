@@ -20,24 +20,12 @@ az upgrade
 ```
 
 ### 1.2 리전 롤아웃 상태 확인
-RP가 해당 리전에 v20260428 이상으로 배포 완료된 경우에만 GA 기능 사용 가능.
+RP가 해당 리전에 v20260428 이상으로 배포 완료된 경우에만 GA 기능 사용 가능. 리전별 RP 롤아웃 현황은 [AKS Release Tracker](https://releases.aks.azure.com/)에서 확인할 수 있다.
 
-```bash
-curl -s https://releases.aks.azure.com/parsed_data.json | \
-python3 -c '
-import sys, json
-target = "East US"   # 확인할 리전
-d = json.load(sys.stdin)
-for e in d["Sections"]["RP"]["Components"]["Resource Provider"]["ByRegion"]:
-    if target in e["Regions"]:
-        print(f"{target}: {e[\"Version\"]} / {e[\"Status\"]}")
-        break'
-```
-
-| 리전 (확인 시점 2026-05) | RP 버전 | 상태 |
+| 리전 (확인 시점 2026-06) | RP 버전 | 상태 |
 |---|---|---|
 | East US | v20260428 | ✅ Finished |
-| Korea Central | v20260428 | 🔄 In Progress (대기) |
+| Korea Central | v20260428 | ✅ Finished |
 
 ### 1.3 기존 Istio/Gateway API 리소스 충돌 확인
 다음이 클러스터에 이미 있으면 사전 정리 필요:

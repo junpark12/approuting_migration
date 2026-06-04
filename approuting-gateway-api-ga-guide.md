@@ -723,6 +723,100 @@ Cilium은 IP/CIDR 대신 클러스터와 외부의 트래픽 소스를 의미적
 | 80 / 443 | 외부 HTTP/HTTPS 트래픽 |
 | 15021 | Istio Envoy `/healthz/ready` (LB health probe 대상 포트) |
 
+#### 외부 허용 + 특정 ns만 관리 (ns 겹자 그림)
+
+위 샘플의 `cluster` / `remote-node`는 **클러스터 내 모든 endpoint / 모든 노드 IP**를 뜻하므로, 내부에서는 사실상 ns 경계가 풀린 것과 같다. **외부(world)는 열고, 내부는 특정 ns만 허용**하려면 다음 패턴을 쓴다.
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-ingress-to-gateway
+  namespace: demo
+spec:
+  endpointSelector:
+    matchLabels:
+      istio.io/gateway-name: demo-gateway
+  ingress:
+    # 1) 외부 인터넷 (LB 경유)
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
+
+    # 2) AKS LB health probe (노드 IP → Pod) — health 포트에만 한정
+    - fromEntities:
+        - health
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "15021"
+              protocol: TCP
+
+    # 3) 클러스터 내부 — 특정 ns만 화이트리스트
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: frontend-allowed
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: another-allowed
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
+```
+
+핵심 설계 포인트:
+
+| 변경 | 의도 |
+|---|---|
+| `cluster` 제거 | 내부 전체 허용을 없애고 ns 단위 화이트리스트로 전환 |
+| `fromEndpoints` + `k8s:io.kubernetes.pod.namespace` | 이름으로 **특정 ns만** 허용 |
+| `remote-node`를 health 포트(15021)에만 적용 | 80/443에는 노드 IP 소스 차단 (cross-ns SNAT 우회 방지) |
+| 룰 3개로 분리 | 각 출처별로 허용 포트를 다르게 가져갈 수 있음 |
+
+> ⚠️ `externalTrafficPolicy: Cluster`(기본) 환경에서는 외부 트래픽이 노드 간 SNAT 경유로 **`remote-node` 소스로 보일 수 있으므로**, 80/443에서 `remote-node`를 닫으면 외부 접속이 그대로 끊길 가능성이 있다. 안전하게 닫으려면 **§7.4의 `externalTrafficPolicy: Local`을 먼저 적용**해서 외부 소스 IP가 보존되도록 해야 한다.
+
+#### ns label 기반 허용 (확장성 개선)
+
+ns 이름을 정책에 직접 나열하면 새 ns 추가 시마다 정책을 고쳐야 한다. ns 자체에 label을 붙이고 그걸 조건으로 쓰면 운영이 편하다.
+
+```bash
+kubectl label ns frontend-allowed access-to-demo-gw=true
+kubectl label ns another-allowed  access-to-demo-gw=true
+```
+
+```yaml
+    - fromEndpoints:
+        - matchLabels:
+            access-to-demo-gw: "true"   # ns label 기반 화이트리스트
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
+```
+
+> 참고: Cilium의 `fromEndpoints` matchLabel은 대상 endpoint(Pod)의 레이블과, 그 Pod이 속한 **ns의 레이블**을 모두 매칭한다. 그래서 ns에 붙인 `access-to-demo-gw=true`도 그대로 필터 조건으로 사용 가능.
+
+#### 검증 / 트러블슈팅
+
+```bash
+# 차단되는 소스 모니터링
+kubectl exec -n kube-system ds/cilium -- \
+  cilium monitor --type drop | grep <gateway-pod-ip>
+
+# 해당 Pod에 적용된 정책 확인
+kubectl exec -n kube-system ds/cilium -- \
+  cilium endpoint list | grep demo
+```
+
 #### 다음 단계
 
 - **외부 허용**은 위 정책으로 충분하며, **Gateway → 백엔드 Pod 구간**(동일 ns 또는 cross-ns)은 별도 NetworkPolicy로 제어한다. ns 간 연결 제어 파트는 고객 측 자체 테스트 예정.

@@ -665,6 +665,70 @@ kubectl get deploy -n aks-istio-system -l app=istiod \
 - 임시 회피책은 없음 (고객이 스펙을 patch 해도 reconcile 됨).
 - Gateway data plane(Envoy)의 HPA는 정상 동작하므로 서비스 가용성에 직접 영향은 없으나, 관제 이벤트 필터링이 필요할 수 있음.
 
+### 10.2 Network Policy (Cilium) 구성
+
+#### 배경 — 왜 설정이 필요한가
+
+기존 NGINX Ingress는 **중앙집중형**으로, IngressController가 단일 ns(보통 `app-routing-system`)에 종료 되어 Internal LB IP를 하나만 할당받아 모든 테넌트 트래픽을 처리했다. 따라서 NetworkPolicy도 해당 ns 1곳만 열어주면 충분했다.
+
+Gateway API 방식은 **ns 별로 Gateway pod가 분산 배포**되고 각 Gateway가 자체 LB IP를 할당받는다. 그래서 트래픽을 받을 ns 입장에서 **외부 인그레스를 명시적으로 허용하는 NetworkPolicy가 필수**이다. 본 프로젝트는 Cilium으로 NetworkPolicy enforcement가 되어 있으므로 표준 K8s `NetworkPolicy` 대신 **CiliumNetworkPolicy**를 사용한다 (Cilium 전용 entity 표현이 필요).
+
+#### Gateway pod로의 외부 ingress 허용 예시
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-ingress-to-gateway
+  namespace: demo
+spec:
+  endpointSelector:
+    matchLabels:
+      istio.io/gateway-name: demo-gateway   # 실제 Gateway 리소스 이름으로
+  ingress:
+    - fromEntities:
+        - world
+        - cluster
+        - health         # AKS LB health probe
+        - remote-node
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
+            - port: "15021"   # Istio status/health
+              protocol: TCP
+```
+
+#### `fromEntities` 값 설명
+
+Cilium은 IP/CIDR 대신 클러스터와 외부의 트래픽 소스를 의미적 **entity**로 추상화해서 정책을 쓸 수 있게 한다. 주요 entity:
+
+| Entity | 의미 | 이 정책에서 쓰는 이유 |
+|---|---|---|
+| `world` | 클러스터 외부 모든 IP (인터넷 등) | LB를 통해 들어오는 **외부 사용자 트래픽** 허용 |
+| `cluster` | 같은 클러스터 내 모든 endpoint(Pod, host) | 클러스터 내부에서 Gateway를 호출하는 경우 (East-West 테스트 포함) |
+| `host` | Pod이 돌고 있는 **그 노드 자체**(local node IP, hostNetwork) | kubelet/health probe 등 로컬 노드 소스 트래픽 |
+| `remote-node` | **다른 클러스터 노드**의 IP | 타 노드에서 kube-proxy/SNAT으로 온 트래픽, 노드 간 health 찴리 등 |
+| `health` | Cilium agent의 health probe (cilium-health) | 노드 간 네트워킹 헬스체크 트래픽 허용 |
+| `kube-apiserver` | API server | (이 정책에서는 불필요) |
+
+> 프로토콜상 AKS LB health probe는 노드 IP로 도착하므로 `host`/`remote-node` 조합으로 커버되며, `health`는 Cilium 자체 진단 트래픽용이다.
+
+#### 포트 설명
+
+| 포트 | 용도 |
+|---|---|
+| 80 / 443 | 외부 HTTP/HTTPS 트래픽 |
+| 15021 | Istio Envoy `/healthz/ready` (LB health probe 대상 포트) |
+
+#### 다음 단계
+
+- **외부 허용**은 위 정책으로 충분하며, **Gateway → 백엔드 Pod 구간**(동일 ns 또는 cross-ns)은 별도 NetworkPolicy로 제어한다. ns 간 연결 제어 파트는 고객 측 자체 테스트 예정.
+- Cilium은 **정책이 적용된 Pod은 default-deny로 전환**되므로, Gateway pod 외의 백엔드에도 필요한 상호 허용을 누락없이 작성해야 한다.
+- 계켡플레인(istiod) 관련 트래픽 허용이 필요한 경우는 `aks-istio-system` ns를 `fromEndpoints`/`namespaceSelector`로 지정해 열어준다.
+
 ---
 
 ## 11. Istio service mesh add-on과의 차이

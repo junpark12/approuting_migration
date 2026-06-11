@@ -414,8 +414,9 @@ ContainerLogV2
 → `x_forwarded_for` / `downstream_remote_address`에 실제 client public IP가 기록되는 것을 확인.
 
 > ⚠️ `externalTrafficPolicy: Local` 사이드 이펙트
-> - 외부 트래픽을 수신한 노드에 **해당 Gateway의 Pod가 1개 이상 있어야** 라우팅됨. Pod 없는 노드로 인입되면 패킷 drop → AKS LB의 health probe가 자동으로 Pod 없는 노드를 제외하므로 통상 문제 없으나, **HPA min replicas는 노드 수 대비 충분히** 두는 것이 안전.
-> - **트래픽이 노드 간 균등 분산되지 않을 수 있음** (노드별 Pod 수 차이에 따라). 필요 시 §9의 `topologySpreadConstraints`로 분산.
+> - 외부 트래픽을 수신한 노드에 **해당 Gateway의 Pod가 1개 이상 있어야** 라우팅됨. Pod 없는 노드로 인입되면 패킷 drop → 통상은 AKS LB의 health probe가 Pod 없는 노드를 자동 제외하므로 문제없으나, **HPA min replicas는 노드 수 대비 충분히** 두는 것이 안전.
+> - ⚠️ **단, Gateway Service가 다중 포트(예: 80 + 443)를 노출하면** "health probe가 Pod 없는 노드를 자동 제외"하는 위 전제가 **한 포트에서만 성립**합니다. Kubernetes는 svc당 `healthCheckNodePort`를 하나만 가질 수 있어, 나머지 포트는 모든 노드가 healthy로 표기되어 Pod 없는 노드로도 트래픽이 흘러들어갑니다(간헐적 connection refused). → **다중 포트 + Local 사용 시 반드시 [§10.3](#103-알려진-이슈--다중-포트--externaltrafficpolicy-local-조합-health-probe-미동작-bug)의 포트별 health-probe annotation 워크어라운드를 함께 적용**해야 합니다.
+> - 트래픽이 노드 간 균등 분산되지 않을 수 있음 (노드별 Pod 수 차이에 따라). 필요 시 §9의 `topologySpreadConstraints`로 분산.
 
 ---
 
@@ -503,11 +504,21 @@ data:
 #### Service (`data.service`)
 | 필드 | 용도 |
 |---|---|
-| `metadata.labels` / `annotations` | LB annotation은 보통 `Gateway.spec.infrastructure.annotations`에서 처리(§6 참고) |
+| `metadata.labels` / `annotations` | LB annotation은 보통 `Gateway.spec.infrastructure.annotations`에서 처리(§6 참고). 포트별 health-probe annotation은 아래 참고 |
 | `spec.type` | Service type |
 | `spec.loadBalancerSourceRanges` | LB 인입 CIDR 제한 |
 | `spec.loadBalancerClass` | LB 컨트롤러 선택 |
 | `spec.externalTrafficPolicy` / `internalTrafficPolicy` | 트래픽 정책 (`Local` 등) |
+
+##### 포트별 health-probe annotation (다중 포트 + Local 조합 시 필수)
+
+`data.service`의 `metadata.annotations`에 아래 annotation을 **포트별로** 넣으면, 각 포트의 health check가 개별로 등록되도록 연결됩니다 (§10.3 이슈 워크어라운드).
+
+| Annotation (`<port>` 자리에 실제 포트) | 용도 |
+|---|---|
+| `service.beta.kubernetes.io/port_<port>_health-probe_port` | 해당 포트용 health probe 포트 |
+| `service.beta.kubernetes.io/port_<port>_health-probe_protocol` | probe 프로토콜 (http 등) |
+| `service.beta.kubernetes.io/port_<port>_health-probe_request-path` | probe 경로 (/healthz 등) |
 
 #### HorizontalPodAutoscaler (`data.horizontalPodAutoscaler`)
 | 필드 | 용도 |
@@ -821,7 +832,111 @@ kubectl exec -n kube-system ds/cilium -- \
 
 - **외부 허용**은 위 정책으로 충분하며, **Gateway → 백엔드 Pod 구간**(동일 ns 또는 cross-ns)은 별도 NetworkPolicy로 제어한다. ns 간 연결 제어 파트는 고객 측 자체 테스트 예정.
 - Cilium은 **정책이 적용된 Pod은 default-deny로 전환**되므로, Gateway pod 외의 백엔드에도 필요한 상호 허용을 누락없이 작성해야 한다.
-- 계켡플레인(istiod) 관련 트래픽 허용이 필요한 경우는 `aks-istio-system` ns를 `fromEndpoints`/`namespaceSelector`로 지정해 열어준다.
+- 컨트롤플레인(istiod) 관련 트래픽 허용이 필요한 경우는 `aks-istio-system` ns를 `fromEndpoints`/`namespaceSelector`로 지정해 열어준다.
+
+---
+
+### 10.3 알려진 이슈 — 다중 포트 + `externalTrafficPolicy: Local` 조합 health probe 미동작 (Bug)
+
+**증상**
+
+source IP 보존을 위해 `externalTrafficPolicy: Local`(§7.4)을 적용한 상태에서, Gateway Service가 **다중 포트를 노출**하면(예: 15021 + 80, 또는 80 + 443) 일부 포트의 LB health check가 비정상 동작한다. 결과적으로 외부 `curl`이 **간헐적으로 성공/실패(약 50%)를 반복**하며 `connection refused`가 발생한다.
+
+자동 생성되는 svc에 포트가 2개 잡히고, `healthCheckNodePort`는 **그중 한 포트에 대해서만** 체크한다.
+
+| 포트 | LB health status | 판정 |
+|---|---|---|
+| 정상 포트(예: 15021) | Pod 있는 노드만 `up`, 없는 노드 `down` | ✅ healthCheckNodePort 연결 |
+| 문제 포트(예: 80) | **모든 노드 `up`** (Pod 없는 노드 포함) | ❌ health check 무관하게 트래픽 유입 → drop |
+
+**원인**
+
+Kubernetes는 **하나의 Service가 `healthCheckNodePort`를 하나만 가질 수 있다**는 제약이 있다. App Routing Gateway API가 자동 생성하는 Service는 다중 포트를 갖는데, `Local` 정책에서는 이 단일 healthCheckNodePort가 한 포트의 health만 대표하게 되어 **나머지 포트는 모든 노드가 healthy로 오인식**된다. 이는 이 기능에서 자동 생성되는 svc + `Local` 조합의 특수 이슈로 확인되었으며, **근본 fix 방향은 PG(제품팀) 검토/논의 중 (ETA 미정)** 이다.
+
+> 참고: 일반적인(App Routing Gateway API가 아닌) 단일 포트 Service에서 `Local`은 Pod 없는 노드를 정상 제외하므로 expected behavior다. 본 이슈는 **다중 포트** 조건에서만 드러난다.
+
+**워크어라운드 — 포트별 health-probe annotation 명시**
+
+`Local`을 유지하면서(= source IP 보존 요구 충족) 문제를 해소하려면, ConfigMap의 `data.service.metadata.annotations`에 **포트별 health-probe annotation**을 명시해 각 포트의 health check를 개별 연결한다 (§9.4 Service allow-list 참고). §7.4의 ConfigMap에 annotation을 추가한 형태:
+
+```yaml
+# Gateway-level ConfigMap 예시 (특정 Gateway에만 적용)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-gateway-overrides
+  namespace: demo            # Gateway Pod와 같은 ns
+data:
+  service: |
+    metadata:
+      annotations:
+        service.beta.kubernetes.io/port_80_health-probe_port:
+        service.beta.kubernetes.io/port_80_health-probe_protocol:
+        service.beta.kubernetes.io/port_80_health-probe_request-path:
+        service.beta.kubernetes.io/port_443_health-probe_port:
+        service.beta.kubernetes.io/port_443_health-probe_protocol:
+        service.beta.kubernetes.io/port_443_health-probe_request-path:
+    spec:
+      externalTrafficPolicy: Local
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo-gateway
+  namespace: demo
+spec:
+  gatewayClassName: approuting-istio
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: my-gateway-overrides   # ← 위 ConfigMap 이름과 동일
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+```
+
+- GatewayClass-level(`istio-gateway-class-defaults`, 전역)과 Gateway-level(특정 Gateway) **둘 다 적용 가능**하며, **자동 생성된 svc를 직접 `kubectl edit`하면 안 됩니다** — add-on reconciler가 원복합니다. 반드시 ConfigMap 경로로 적용.
+- 80포트는 annotation **키만 있으면(값 비어도)** 정상 동작이 확인됨. 핵심은 해당 포트용 health-probe annotation 키가 존재해 포트별 health check가 개별 등록되도록 연결되는 것.
+- 포트 추가는 annotation 키의 **포트 번호만 바꿔** 동일 패턴으로 확장.
+
+**검증 / Health Probe ↔ 서비스 매핑 확인**
+
+```bash
+# (1) annotation 반영 확인
+kubectl get svc -n <ns> -l 'gateway.networking.k8s.io/gateway-name=<gateway-name>' -o yaml \
+  | grep -A2 health-probe
+
+# (2) 클러스터 내 — 포트/healthCheckNodePort/정책
+kubectl get svc -n <ns> -l 'gateway.networking.k8s.io/gateway-name=<gateway-name>' -o yaml \
+  | grep -A30 -E "ports:|healthCheckNodePort|externalTrafficPolicy"
+
+# (3) Azure 레이어 — LB probe ↔ rule ↔ backend 매핑 (어떤 포트 rule이 어떤 probe를 쓰는지)
+LB=$(az network lb list -g <MC_resource_group> --query "[0].name" -o tsv)
+az network lb probe list -g <MC_resource_group> --lb-name $LB -o table
+az network lb rule list  -g <MC_resource_group> --lb-name $LB \
+  --query "[].{rule:name, feport:frontendPort, beport:backendPort, probe:probe.id}" -o table
+```
+
+**443(SSL)에서만 `connection refused`가 남는 경우**
+
+80은 정상화되었는데 443만 안 되면 health probe보다 **TLS 설정 쪽**을 먼저 의심한다 (health probe 미동작은 보통 "일부 노드만 실패" 패턴, 전면 `connection refused`는 listener/인증서 가능성).
+
+1. 443 listener가 Gateway에 실제 존재하는가 (`kubectl get gateway <gw> -n <ns> -o yaml` → listeners의 port 443 / protocol HTTPS)
+2. **TLS 인증서(secret) 마운트** — listener `tls.certificateRefs`가 올바른 secret을 가리키고 해당 ns에 존재하는가 (Key Vault 연동 시 SPC 동기화 여부). TLS/Key Vault 구성은 `approuting-gateway-api-tls-kv-guide.md` 참고.
+3. svc에 443 포트가 열려 endpoint가 붙어있는가 (`kubectl describe svc ...` → Endpoints)
+4. gateway(envoy) pod가 443을 listen 하는가 (`kubectl logs <gw-pod> -n <ns> | grep -iE "443|listener|tls"`)
+5. LB probe ↔ 443 rule이 올바른 backend를 향하는가 (위 검증 (3))
+
+**상태 요약**
+
+| 항목 | 상태 |
+|---|---|
+| 80포트 health check | ✅ 정상 (포트별 annotation 적용 후) |
+| 443(SSL) | ⏳ `connection refused` 추가 확인 필요 (TLS 쪽 우선 점검) |
+| Local 설정 목적 | source IP(real IP) 보존 |
+| 근본 fix | ⏳ PG 검토/배포 대기, ETA 미정 (K8s svc당 healthCheckNodePort 1개 제약 관련) |
 
 ---
 

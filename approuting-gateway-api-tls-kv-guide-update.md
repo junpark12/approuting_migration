@@ -71,6 +71,23 @@ KV TLS 턴키를 쓰려면 클러스터에 아래가 모두 활성화되어야 �
 
 > ⚠️ `az aks approuting update` 의 `--attach-kv` / `--attach-zones` 플래그는 **레거시 NGINX 경험용**(add-on 자체 MI 에 KV/DNS 권한 부여)이다. **Gateway API 통합은 이를 사용하지 않으며**, 대신 사용자 UAMI + Workload Identity + FIC 로 동작한다.
 
+> 📌 **KV CSI add-on 이 이미 활성화된 경우 — `--enable-kv` 생략 가능**
+> - `az aks enable-addons --addons azure-keyvault-secrets-provider` 로 이미 활성화 → CSI Driver/Provider Pod 이 이미 떠 있음 → `--enable-kv` **생략 가능**.
+> - 중복 적용해도 **멱등(idempotent)** 이라 에러는 안 나고 "이미 활성화됨" 수준으로 무시된다.
+>
+> **확인 방법** — 실제로 켜져 있는지 두 가지로 검증:
+>
+> ```bash
+> # 1) add-on 프로파일 상태
+> az aks show -g $RESOURCE_GROUP -n $CLUSTER \
+>   --query "addonProfiles.azureKeyvaultSecretsProvider.enabled"
+> # true 면 OK
+>
+> # 2) Driver/Provider Pod 동작 확인
+> kubectl get pods -n kube-system -l app=secrets-store-csi-driver
+> kubectl get pods -n kube-system -l app=secrets-store-provider-azure
+> ```
+
 환경 변수:
 
 ```bash

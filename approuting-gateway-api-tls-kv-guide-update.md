@@ -219,6 +219,82 @@ done
 
 > `azure.workload.identity/client-id` annotation 이 SA 를 UAMI 와 연결하고, `azure.workload.identity/use: "true"` label 이 Workload Identity webhook 으로 하여금 federated token 을 pod 에 주입하게 한다. **둘 다 필수**.
 
+### 5.1 Shared Gateway 시나리오 — Gateway 를 한 ns 에 두고 여러 ns 가 공유
+
+운영에서 흔한 토폴로지: **Gateway(+TLS)를 ns `a` 한 곳에 두고**, 서비스별 `HTTPRoute` 는 각자 ns(`b`, `c`)에 두어 `a` 의 Gateway 를 참조하는 구조(= Shared Gateway / 1개 IP 공유).
+
+이 경우 **SA 와 FIC 는 Gateway 가 있는 ns `a` 에만 구성하면 된다.**
+
+#### 왜 a 에만 구성하면 되나
+TLS 인증서 동기화의 모든 키가 **Gateway listener** 에 묶여 있기 때문이다:
+- `tls-cert-keyvault-uri` / `tls-cert-service-account` 는 **listener(ns a)** 에 선언된다.
+- operator 는 그 SA 를 **Gateway 의 namespace(a)** 에서 찾고, **SPC·TLS Secret 도 ns a 에 생성**한다.
+- `HTTPRoute` 는 TLS 와 무관하다 — 경로→백엔드 라우팅만 하고 인증서를 가져오지 않는다.
+
+→ 따라서 `b`/`c` 의 `HTTPRoute` 가 `a` 의 Gateway 를 참조해도 **`b`/`c` 에는 SA/FIC 가 필요 없다.**
+
+```
+ns a: Gateway(listener TLS) + SA + FIC + SPC + Secret   ← 인증서 관련은 전부 여기
+ns b: HTTPRoute ──▶ a 의 Gateway 참조 (TLS 무관)
+ns c: HTTPRoute ──▶ a 의 Gateway 참조 (TLS 무관)
+```
+
+#### 대신 챙겨야 할 두 가지 (cross-namespace 라우팅 조건)
+
+**1) Gateway 의 `allowedRoutes` 를 다른 ns 에 개방** — 기본 예시(§6)는 `from: Same` 이라 같은 ns 만 허용한다. 다른 ns 의 Route 를 받으려면:
+
+```yaml
+listeners:
+- name: https
+  hostname: "*.example.com"
+  port: 443
+  protocol: HTTPS
+  tls:
+    mode: Terminate
+    options:
+      kubernetes.azure.com/tls-cert-keyvault-uri: $CERT_URI
+      kubernetes.azure.com/tls-cert-service-account: $SA_NAME
+  allowedRoutes:
+    namespaces:
+      from: All        # 또는 from: Selector + matchLabels 로 특정 ns 만 허용
+```
+
+**2) HTTPRoute 의 cross-ns `parentRef`** — `b`/`c` 의 HTTPRoute 가 `a` 의 Gateway 를 명시:
+
+```yaml
+# ns b
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: b-route
+  namespace: b
+spec:
+  parentRefs:
+  - name: shared-gateway
+    namespace: a          # ← cross-ns 참조
+  hostnames: ["b.example.com"]
+  rules:
+  - matches:
+    - path: { type: PathPrefix, value: / }
+    backendRefs:
+    - name: b-service
+      port: 8080
+```
+
+> ℹ️ **ReferenceGrant 불필요**: HTTPRoute → Gateway 방향 참조는 ReferenceGrant 가 필요 없다. ReferenceGrant 가 필요한 경우는 listener 가 **다른 ns 의 Secret** 을 참조할 때인데, 본 시나리오는 TLS Secret 이 Gateway 와 같은 ns `a` 에 있으므로 해당 없음.
+
+#### 정리
+
+| 구성요소 | 필요한 위치 |
+|---|---|
+| SA + FIC | **ns a 만** (Gateway 있는 곳) |
+| SPC + TLS Secret | ns a (operator 자동 생성) |
+| Gateway `allowedRoutes: from: All`/`Selector` | ns a |
+| HTTPRoute (cross-ns `parentRef`) | ns b, c |
+| ReferenceGrant | 불필요 (Secret 이 a 에 있으므로) |
+
+> 💡 이 패턴이 곧 **Shared Gateway(1개 IP 공유) + 서비스별 HTTPRoute** 토폴로지다. TLS·SA·FIC 를 `a` 에 모으면 각 서비스 팀(`b`/`c`)은 HTTPRoute 만 얹으면 된다.
+
 ---
 
 ## 6. Gateway 에서 TLS 종료 구성 (핵심)

@@ -94,6 +94,20 @@ az aks update -g $RESOURCE_GROUP -n $CLUSTER --enable-app-routing-istio
 az aks get-credentials -g $RESOURCE_GROUP -n $CLUSTER --overwrite-existing
 ```
 
+### 3.4 ⚠️ Istio Gateway 전환 후 기본 NGINX Ingress Controller 재생성 방지
+
+App Routing add-on의 기본 NGINX 설정값은 `AnnotationControlled`이다. `--enable-app-routing-istio`로 Istio Gateway를 활성화하고 NGINX Ingress 리소스를 모두 걷어낸 뒤에도, 이 기본값을 **명시적으로 바꾸지 않으면** add-on operator(reconciler)가 `app-routing-system` ns와 기본 `NginxIngressController`(default nginx ingress controller)를 계속 자동으로 재생성한다.
+
+**컷오버(트래픽 전환) 완료 후, NGINX를 더 이상 쓰지 않는다면 다음 명령을 반드시 실행**해 기본 NGINX 생성을 끈다:
+
+```bash
+az aks approuting update -g $RESOURCE_GROUP -n $CLUSTER --nginx None
+```
+
+> - `--nginx None`은 기본 NGINX ingress controller를 **생성하지 않으며, 이미 있어도 삭제하지 않는다.** 기존에 남아있는 default `NginxIngressController` CR은 필요 시 별도로 수동 삭제해야 한다.
+> - 이 명령을 실행하지 않으면 Istio Gateway로 완전히 전환한 뒤에도 `app-routing-system` ns / nginx controller pod가 계속 재생성되어 리소스가 낭비되고, 두 ingress 경로가 혼재하는 것처럼 오인될 수 있다.
+> - 참고: [`az aks approuting update`](https://learn.microsoft.com/en-us/cli/azure/aks/approuting#az-aks-approuting-update) — `--nginx` 허용값: `AnnotationControlled`(기본) / `External` / `Internal` / `None`.
+
 ---
 
 ## 4. 설치 검증
@@ -637,9 +651,11 @@ kubectl get hpa httpbin-gateway-approuting-istio
 | Egress 트래픽 관리 | ❌ 미지원 | — |
 | Sidecar injection / Istio CRD 사용 | ❌ 미지원 (인프라 전용) | 메시 기능 필요 시 Istio mesh add-on 별도 사용 |
 
-### 10.1 알려진 이슈 — istiod HPA `requests.cpu` 누락 (Bug)
+### 10.1 ✅ [Fixed] istiod HPA `requests.cpu` 누락 (Bug) — 2026-07-08 확인, 배포 완료
 
-**증상**
+> **업데이트 (2026-07-08)**: 클러스터에서 재확인 결과 **Fix가 배포되어 해결됨**. 아래는 GA 시점에 관측되었던 원 증상 기록이며, 현재는 `istiod` Deployment Pod 스펙에 `resources.requests.cpu`가 정상적으로 설정되어 HPA가 정상 동작한다. 재발 여부는 `kubectl describe hpa -n aks-istio-system <istiod-hpa-name>`으로 `FailedGetResourceMetric` 경고가 더 이상 발생하지 않는지 확인하면 된다.
+
+**증상 (Fix 이전)**
 
 App Routing Gateway API 활성화 시 `aks-istio-system` ns에는 고객 요청을 직접 처리하지는 않지만 컨트롤 플레인 `istiod-asm-...` Deployment가 자동 배포되며, 함께 HPA(HorizontalPodAutoscaler)도 생성된다. 그러나 해당 Deployment의 Pod 스펙에 **`resources.requests.cpu`가 누락**되어 HPA가 CPU 사용률을 계산할 기준점을 찾지 못해 이벤트에 오류가 반복 발생한다.
 
@@ -660,7 +676,7 @@ kubectl get deploy -n aks-istio-system -l app=istiod \
   -o jsonpath='{.items[*].spec.template.spec.containers[*].resources}'
 ```
 
-**영향**
+**영향 (Fix 이전)**
 
 - istiod HPA가 metric 계산 불가 → **자동 스케일 아웃 미작동** (`minReplicas`로 고정 운영)
 - 관제/모니터링에서 이벤트 노이즈로 알람 오인식 가능
@@ -668,13 +684,13 @@ kubectl get deploy -n aks-istio-system -l app=istiod \
 
 **원인**
 
-`aks-istio-system` ns는 **AKS add-on managed** 영역으로, 고객이 Deployment/HPA 스펙을 직접 patch해도 add-on reconciler가 원상복구한다. AKS 측에서 배포하는 istiod manifest에 `requests.cpu`가 누락되어 있어 **고객 측 워크어라운드 불가**.
+`aks-istio-system` ns는 **AKS add-on managed** 영역으로, 고객이 Deployment/HPA 스펙을 직접 patch해도 add-on reconciler가 원상복구한다. AKS 측에서 배포하는 istiod manifest에 `requests.cpu`가 누락되어 있어 **고객 측 워크어라운드 불가**했다.
 
-**대응**
+**대응 (현재 상태)**
 
-- 본 항목은 **AKS(Microsoft) 쪽에서 관리하는 영역**이므로, **Azure Support 케이스를 통해 bug fix 요청** 예정.
-- 임시 회피책은 없음 (고객이 스펙을 patch 해도 reconcile 됨).
-- Gateway data plane(Envoy)의 HPA는 정상 동작하므로 서비스 가용성에 직접 영향은 없으나, 관제 이벤트 필터링이 필요할 수 있음.
+- ✅ **Fixed** — AKS 측 istiod manifest에 `resources.requests.cpu`가 추가되어 배포됨(2026-07-08 확인). 별도 조치 불필요.
+- 과거 Azure Support 케이스로 회피책 없이 fix를 기다려야 했던 사항이었으나, 현재는 해소됨.
+- 혹시 오래된 리전/링에서 재발 시에는 `kubectl get deploy -n aks-istio-system -l app=istiod -o jsonpath='{.items[*].spec.template.spec.containers[*].resources}'`로 `requests.cpu` 존재 여부를 재확인.
 
 ### 10.2 Network Policy (Cilium) 구성
 
@@ -977,6 +993,7 @@ az network lb rule list  -g <MC_resource_group> --lb-name $LB \
 - [ ] Internal/External LB 요구사항에 맞춰 annotation 적용
 - [ ] (별도 가이드) TLS / Key Vault 인증서 연동
 - [ ] (별도 작업) NGINX Ingress → HTTPRoute 마이그레이션 및 트래픽 컷오버
+- [ ] 컷오버 완료 후 `az aks approuting update --nginx None` 실행 → 기본 NGINX ns/controller 자동 재생성 방지 (§3.4)
 
 ---
 

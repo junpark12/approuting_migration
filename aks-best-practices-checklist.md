@@ -1,6 +1,6 @@
 # AKS 운영 클러스터 Best Practice 체크리스트 (High/Medium 우선순위)
 
-이 문서는 [The AKS Checklist](https://www.the-aks-checklist.com/) ([GitHub: lgmorand/aks-checklist](https://github.com/lgmorand/aks-checklist))의 공개 항목(High/Medium 우선순위, 총 124개)에, 체크리스트 사이트에는 없는 최신 AKS 기능(Deployment Safeguards, Image Cleaner, Node Autoprovisioning, VPA, KEDA 등 8개) 기반 항목을 추가하여 재구성한 것이다.
+이 문서는 [The AKS Checklist](https://www.the-aks-checklist.com/) ([GitHub: lgmorand/aks-checklist](https://github.com/lgmorand/aks-checklist))의 공개 항목(High/Medium 우선순위, 총 124개)에, 체크리스트 사이트에는 없는 최신 AKS 기능(Deployment Safeguards, Image Cleaner, Node Autoprovisioning, VPA, KEDA, ACR Task 자동 리빌드 등 9개) 기반 항목을 추가하여 재구성한 것이다.
 
 > ⚠️ **목적**: 특정 마이그레이션(App Routing 등)에 한정되지 않은, **현재 운영 중인 AKS 클러스터가 일반적인 프로덕션 모범사례를 준수하고 있는지** 점검하기 위한 범용 체크리스트다.
 
@@ -26,8 +26,8 @@
 | Resource Management | 6 |
 | Cluster Multi | 3 |
 | **소계** | **124** |
-| **추가 항목** (체크리스트 사이트에 없는 최신 기능) | **8** |
-| **총계** | **132** |
+| **추가 항목** (체크리스트 사이트에 없는 최신 기능) | **9** |
+| **총계** | **133** |
 
 ---
 
@@ -1196,6 +1196,43 @@ az aks create -g $RESOURCE_GROUP -n $CLUSTER --sku automatic
 ```
 
 `ADDITIONAL` `OPERATIONS` `SECURITY` `GOVERNANCE`
+---
+
+## [Medium] ACR Task로 베이스 이미지 업데이트 시 컨테이너 이미지 자동 리빌드
+
+**설명**: 애플리케이션 이미지를 한 번 빌드한 뒤 방치하면, 베이스 이미지(OS/런타임)에 보안 패치가 나와도 재빌드가 되지 않아 운영 중인 이미지에 알려진 취약점이 계속 남아있게 됩니다. ACR Task는 Git commit 트리거 외에도 **베이스 이미지 업데이트 트리거**와 **타이머(cron) 트리거**를 지원해서, 베이스 이미지가 갱신되거나 정해진 주기가 되면 ACR이 자동으로 `docker build`를 다시 실행하고 새 이미지를 레지스트리에 push하도록 구성할 수 있습니다. AKS 노드가 최신 패치를 받는 것과 별개로, 컨테이너 이미지 자체도 지속적으로 최신화해야 공급망 전체의 패치 지연을 줄일 수 있습니다.
+
+**확인 방법 (az cli)**:
+```bash
+# 레지스트리에 구성된 Task 목록 확인 (트리거 유형은 Portal Trigger 열 아이콘 또는 show로 확인)
+az acr task list --registry <ACR_NAME> --output table
+
+# 특정 Task의 트리거 구성(베이스 이미지/커밋/타이머) 상세 확인
+az acr task show --registry <ACR_NAME> --name <TASK_NAME> --query "{step:step, trigger:trigger}" --output json
+
+# 최근 실행 이력(자동 리빌드가 실제로 동작했는지) 확인
+az acr task list-runs --registry <ACR_NAME> --output table
+```
+
+**권장 방식으로 변경**:
+```bash
+# Dockerfile 기반 Task 생성 시 베이스 이미지 업데이트 트리거를 기본 활성화(Default: true)
+az acr task create --registry <ACR_NAME> --name <TASK_NAME> \
+  --image <REPOSITORY>:{{.Run.ID}} \
+  --context <GIT_REPO_URL_OR_OCI_CONTEXT> --file Dockerfile \
+  --base-image-trigger-type Runtime
+
+# 기존 Task에 베이스 이미지 트리거만 별도로 켜고 싶다면
+az acr task update --registry <ACR_NAME> --name <TASK_NAME> --base-image-trigger-enabled true
+
+# 주기적 리빌드가 추가로 필요하면 cron 기반 타이머 트리거도 함께 구성 가능
+az acr task create --registry <ACR_NAME> --name <TASK_NAME> \
+  --image <REPOSITORY>:{{.Run.ID}} \
+  --context <GIT_REPO_URL_OR_OCI_CONTEXT> --file Dockerfile \
+  --schedule "0 0 * * *"
+```
+
+`CONTAINER` `ALL` `OPERATIONS` `SECURITY`
 ---
 
 ## [Medium] Bastion 호스트를 통해 노드에 안전하게 연결하세요
